@@ -1984,13 +1984,28 @@ export default function App() {
       return;
     }
 
-    // Web: render the ticket into the *main* document and use @media print to hide everything
-    // else, then print the top window. The previous approach (a hidden iframe + its own
-    // print()) works on desktop but NOT on Chrome for Android: there window.print() hands off
-    // to Android's OS print service, which prints the top document and ignores the sub-frame —
-    // so it captured whatever was on screen (the "¡Venta Registrada!" modal and its buttons)
-    // instead of the ticket. Printing the top window with only the ticket visible sidesteps
-    // that entirely and renders identically to the desktop PDF preview.
+    // Web: open the ticket in its own tab that prints itself on load. This is the only
+    // approach verified to render correctly on Chrome for Android (tested on the client's
+    // device): its print service rasterizes the *visible page* — it ignores both hidden
+    // iframes and @media print show/hide scoping in the main document, which is why those
+    // two earlier attempts printed a screenshot of the app (the "¡Venta Registrada!" modal)
+    // instead of the ticket. In a dedicated tab, the visible page IS the ticket. `onload`
+    // only fires once images (the logo) are in, and window.close() leaves no stray tab.
+    // The in-app-WebView navigation bug that originally motivated moving away from
+    // window.open only affected the APK, which no longer reaches this code path at all
+    // (native Bluetooth/ReceiptPrinter branches return above).
+    const popupHtml = ticketText.replace('<body>', '<body onload="window.print(); window.close();">');
+    const ticketWindow = window.open('', '_blank');
+    if (ticketWindow) {
+      ticketWindow.document.open();
+      ticketWindow.document.write(popupHtml);
+      ticketWindow.document.close();
+      return;
+    }
+
+    // Popup blocked: fall back to rendering the ticket inside the main document and hiding
+    // everything else via @media print. Fine on desktop browsers; on Chrome for Android it
+    // may print the visible screen instead (see above), so the popup path is preferred.
     document.getElementById('logicpos-print-root')?.remove();
     document.getElementById('logicpos-print-style')?.remove();
 
