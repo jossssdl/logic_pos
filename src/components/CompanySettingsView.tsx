@@ -63,6 +63,11 @@ interface PrintConfig {
   footerText: string;
 }
 
+interface BluetoothPrinterDevice {
+  name: string;
+  address: string;
+}
+
 interface CompanySettingsViewProps {
   companyId: string;
   companyName: string;
@@ -84,6 +89,11 @@ interface CompanySettingsViewProps {
   onSaveBranding?: (branding: Branding) => Promise<void>;
   printConfig?: PrintConfig;
   onSavePrintConfig?: (config: PrintConfig) => Promise<void>;
+  isNativePlatform?: boolean;
+  bluetoothPrinter?: BluetoothPrinterDevice | null;
+  onScanBluetoothPrinters?: () => Promise<BluetoothPrinterDevice[]>;
+  onSelectBluetoothPrinter?: (device: BluetoothPrinterDevice | null) => void;
+  onTestPrintBluetooth?: () => Promise<void>;
   isCredentialEmployee?: boolean;
 }
 
@@ -108,6 +118,11 @@ export default function CompanySettingsView({
   onSaveBranding,
   printConfig,
   onSavePrintConfig,
+  isNativePlatform = false,
+  bluetoothPrinter = null,
+  onScanBluetoothPrinters,
+  onSelectBluetoothPrinter,
+  onTestPrintBluetooth,
   isCredentialEmployee = false
 }: CompanySettingsViewProps) {
   const [activeSubTab, setActiveSubTab] = useState<'info' | 'team' | 'code' | 'branding' | 'print' | 'backup'>('team');
@@ -196,6 +211,42 @@ export default function CompanySettingsView({
   const [printShowTaxLine, setPrintShowTaxLine] = useState(printConfig?.showTaxLine ?? true);
   const [printFooterText, setPrintFooterText] = useState(printConfig?.footerText ?? '¡Gracias por su compra!');
   const [isSavingPrint, setIsSavingPrint] = useState(false);
+
+  // Bluetooth thermal printer pairing (58/80mm ESC/POS, e.g. MERION PT-B1)
+  const [btScanning, setBtScanning] = useState(false);
+  const [btDevices, setBtDevices] = useState<BluetoothPrinterDevice[]>([]);
+  const [btError, setBtError] = useState('');
+  const [btTesting, setBtTesting] = useState(false);
+
+  const handleScanBt = async () => {
+    if (!onScanBluetoothPrinters) return;
+    setBtScanning(true);
+    setBtError('');
+    try {
+      const devices = await onScanBluetoothPrinters();
+      setBtDevices(devices);
+      if (devices.length === 0) {
+        setBtError('No hay impresoras emparejadas. Empareja la impresora primero desde los ajustes de Bluetooth de Android.');
+      }
+    } catch (err: any) {
+      setBtError(err?.message || 'No se pudo buscar impresoras Bluetooth.');
+    } finally {
+      setBtScanning(false);
+    }
+  };
+
+  const handleTestBt = async () => {
+    if (!onTestPrintBluetooth) return;
+    setBtTesting(true);
+    setBtError('');
+    try {
+      await onTestPrintBluetooth();
+    } catch (err: any) {
+      setBtError(err?.message || 'No se pudo imprimir la prueba.');
+    } finally {
+      setBtTesting(false);
+    }
+  };
 
   React.useEffect(() => {
     setBrandDisplayName(branding.displayName || '');
@@ -1624,6 +1675,70 @@ export default function CompanySettingsView({
                   Funciona con cualquier impresora que el sistema operativo tenga instalada — Epson, Star, BIXOLON, MERION, HP, Brother, etc.
                 </p>
               </div>
+
+              {/* Bluetooth thermal printer (58/80mm ESC/POS, e.g. MERION PT-B1) */}
+              {isNativePlatform && (
+                <div className="space-y-2 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                  <label className="text-[11px] font-bold text-slate-600 block">Impresora térmica Bluetooth</label>
+                  <p className="text-[10px] text-slate-400">
+                    Para impresoras térmicas ESC/POS (MERION, Goojprt, Xprinter, etc.) que no aparecen en el diálogo normal de impresión. Primero empareja la impresora desde los ajustes de Bluetooth de Android, luego búscala aquí.
+                  </p>
+
+                  {bluetoothPrinter ? (
+                    <div className="flex items-center justify-between p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg">
+                      <div>
+                        <p className="text-xs font-bold text-emerald-800">{bluetoothPrinter.name || 'Impresora'}</p>
+                        <p className="text-[10px] text-emerald-600">{bluetoothPrinter.address}</p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={handleTestBt}
+                          disabled={btTesting}
+                          className="px-2.5 py-1.5 text-[10px] font-bold text-sky-700 bg-sky-100 hover:bg-sky-200 rounded-lg cursor-pointer transition disabled:opacity-50"
+                        >
+                          {btTesting ? 'Imprimiendo...' : 'Prueba'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onSelectBluetoothPrinter?.(null)}
+                          className="px-2.5 py-1.5 text-[10px] font-bold text-red-700 bg-red-100 hover:bg-red-200 rounded-lg cursor-pointer transition"
+                        >
+                          Quitar
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handleScanBt}
+                        disabled={btScanning}
+                        className="w-full py-2 text-xs font-bold text-sky-700 bg-sky-100 hover:bg-sky-200 rounded-lg cursor-pointer transition disabled:opacity-50"
+                      >
+                        {btScanning ? 'Buscando...' : 'Buscar impresoras emparejadas'}
+                      </button>
+                      {btDevices.length > 0 && (
+                        <div className="space-y-1.5 mt-2">
+                          {btDevices.map(d => (
+                            <button
+                              key={d.address}
+                              type="button"
+                              onClick={() => onSelectBluetoothPrinter?.(d)}
+                              className="w-full flex items-center justify-between p-2.5 bg-white border border-slate-200 hover:border-sky-400 rounded-lg text-left cursor-pointer transition"
+                            >
+                              <span className="text-xs font-bold text-slate-700">{d.name || 'Dispositivo sin nombre'}</span>
+                              <span className="text-[10px] text-slate-400">{d.address}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {btError && <p className="text-[10px] text-red-500">{btError}</p>}
+                </div>
+              )}
 
               {/* Toggles */}
               <div className="space-y-3">

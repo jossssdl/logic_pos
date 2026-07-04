@@ -52,6 +52,16 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 // this one; it's registered by name only, matching the @CapacitorPlugin("ReceiptPrinter")
 // annotation on the native side.
 const ReceiptPrinter = registerPlugin<{ print(options: { html: string; jobName?: string }): Promise<{ value: boolean }> }>('ReceiptPrinter');
+
+// Direct ESC/POS printing for Bluetooth thermal printers (e.g. MERION PT-B1) that don't
+// implement Android's Print Framework and so never show up in ReceiptPrinter's system dialog —
+// see android/.../BluetoothPrinterPlugin.java and src/lib/escpos.ts.
+interface BluetoothPrinterDevice { name: string; address: string; }
+const BluetoothPrinter = registerPlugin<{
+  listPairedDevices(): Promise<{ devices: BluetoothPrinterDevice[] }>;
+  printEscPos(options: { address: string; data: string }): Promise<{ value: boolean }>;
+}>('BluetoothPrinter');
+import { buildReceiptEscPos, buildTestPrint, uint8ToBase64, columnsForPaperWidth } from './lib/escpos';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
@@ -334,6 +344,31 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'pos' | 'products' | 'customers' | 'history' | 'analytics' | 'branches' | 'suppliers' | 'settings' | 'invoicing'>('pos');
   const [branding, setBranding] = useState<Branding>({});
   const [printConfig, setPrintConfig] = useState<PrintConfig>(DEFAULT_PRINT_CONFIG);
+
+  // Selected Bluetooth thermal printer (e.g. MERION PT-B1). Tied to this physical device, not
+  // the company/account, so it's kept in localStorage rather than Firestore.
+  const [bluetoothPrinter, setBluetoothPrinter] = useState<BluetoothPrinterDevice | null>(() => {
+    try {
+      const raw = localStorage.getItem('logicpos_bt_printer');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+  const saveBluetoothPrinter = (device: BluetoothPrinterDevice | null) => {
+    setBluetoothPrinter(device);
+    if (device) localStorage.setItem('logicpos_bt_printer', JSON.stringify(device));
+    else localStorage.removeItem('logicpos_bt_printer');
+  };
+  const handleScanBluetoothPrinters = async (): Promise<BluetoothPrinterDevice[]> => {
+    const { devices } = await BluetoothPrinter.listPairedDevices();
+    return devices;
+  };
+  const handleTestPrintBluetooth = async () => {
+    if (!bluetoothPrinter) return;
+    const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth));
+    await BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(bytes) });
+  };
 
   // Apply branding palette to CSS variables and inject dynamic styles
   React.useEffect(() => {
@@ -1010,7 +1045,7 @@ export default function App() {
   // Lock the branch selector for employees
   useEffect(() => {
     if (!user || !activeCompanyId) return;
-    
+
     // Check if the current user is an employee
     const isEmployee = activeCompanyRole === 'employee';
     if (isEmployee && currentUserMember?.assignedBranchId) {
@@ -1810,6 +1845,35 @@ export default function App() {
         </body>
       </html>
     `;
+
+    if (isNativePlatform && bluetoothPrinter) {
+      // Thermal ESC/POS printers (e.g. MERION PT-B1) don't implement Android's Print
+      // Framework, so they never appear in ReceiptPrinter's system dialog below — instead we
+      // talk straight to the paired device over Bluetooth SPP with raw ESC/POS bytes.
+      const escPosBytes = buildReceiptEscPos({
+        businessName: ticketBusinessName,
+        tagline: ticketTagline,
+        saleId: sale.id,
+        timestamp: sale.timestamp,
+        payLabel,
+        customerName: sale.customerName,
+        employeeName: sale.employeeName,
+        items: sale.items,
+        subtotal: sale.subtotal,
+        discount: sale.discount,
+        tax: sale.tax,
+        total: sale.total,
+        showTaxLine: printConfig.showTaxLine,
+        footerText: printConfig.footerText || '¡Gracias por su compra!',
+        columns: columnsForPaperWidth(printConfig.paperWidth),
+        formatMXN,
+      });
+      BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(escPosBytes) }).catch(err => {
+        console.error('Bluetooth print error:', err);
+        alert(`No se pudo imprimir en "${bluetoothPrinter.name}". Verifica que esté encendida y emparejada.`);
+      });
+      return;
+    }
 
     if (isNativePlatform) {
       // Android's WebView never shows a print dialog on window.print() by itself — it needs
@@ -3915,7 +3979,7 @@ export default function App() {
                           >
                             Editar Art.
                           </button>
-                          <button 
+                          <button
                             onClick={() => handleDeleteProduct(prod.id)}
                             className="w-1/2 py-2 hover:bg-purple-50 text-purple-605 text-xs font-bold rounded-xl border border-transparent hover:border-purple-200 cursor-pointer transition text-center"
                           >
@@ -5180,6 +5244,11 @@ export default function App() {
                   if (!activeCompanyId) return;
                   await setDoc(doc(db, 'companies', activeCompanyId, 'settings', 'printConfig'), newConfig, { merge: true });
                 }}
+                isNativePlatform={isNativePlatform}
+                bluetoothPrinter={bluetoothPrinter}
+                onScanBluetoothPrinters={handleScanBluetoothPrinters}
+                onSelectBluetoothPrinter={saveBluetoothPrinter}
+                onTestPrintBluetooth={handleTestPrintBluetooth}
                 isCredentialEmployee={isCredentialEmployee}
               />
             )
@@ -5275,7 +5344,7 @@ export default function App() {
                 
                 <div className="space-y-1">
                   <label className="text-xs font-bold text-slate-500 block">Nombre del Artículo *</label>
-                  <input 
+                  <input
                     type="text"
                     required
                     placeholder="Ej: Sándwich de Pavita"
