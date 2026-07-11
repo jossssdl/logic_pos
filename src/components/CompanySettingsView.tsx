@@ -443,6 +443,10 @@ export default function CompanySettingsView({
   };
 
   const handleBackupToDrive = async () => {
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede gestionar los respaldos de la nube.");
+      return;
+    }
     if (!onGoogleSignInForBackup) return;
     setIsBackingUp(true);
     try {
@@ -493,6 +497,10 @@ export default function CompanySettingsView({
   };
 
   const handleRestoreFromDrive = async () => {
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede gestionar los respaldos de la nube.");
+      return;
+    }
     if (!onGoogleSignInForBackup || !onRestoreCompanyData) return;
     try {
       const accessToken = await onGoogleSignInForBackup();
@@ -552,6 +560,14 @@ export default function CompanySettingsView({
     e.preventDefault();
     if (!credName.trim() || !credUsername.trim()) {
       alert("Por favor completa todos los campos requeridos.");
+      return;
+    }
+    // Team management (registering accounts, role/branch changes) is Owner-only. Mirrors
+    // firestore.rules (members create/update are isOwner()-gated), which rejects this same
+    // write server-side; this check just gives an immediate message instead of a generic
+    // Firestore permission error.
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede registrar nuevas cuentas de equipo.");
       return;
     }
     const cleanUsername = credUsername.trim();
@@ -634,8 +650,8 @@ export default function CompanySettingsView({
 
   const handleSaveRoleAndPermissions = async () => {
     if (!selectedRoleMember) return;
-    if (currentUserRole !== 'owner' && currentUserRole !== 'master_admin' && currentUserRole !== 'admin') {
-      alert("No tienes permisos suficientes para asignar tareas.");
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede asignar tareas adicionales.");
       return;
     }
 
@@ -738,8 +754,8 @@ export default function CompanySettingsView({
   };
 
   const handleGenerateInvoiceInvitationCode = async () => {
-    if (currentUserRole !== 'owner' && currentUserRole !== 'admin') {
-      alert("Solo el Propietario o Administrador puede generar códigos de invitación.");
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede generar códigos de invitación.");
       return;
     }
     setIsUpdating(true);
@@ -777,7 +793,7 @@ export default function CompanySettingsView({
   };
 
   const handleRevokeInvitationCode = async () => {
-    if (currentUserRole !== 'owner' && currentUserRole !== 'admin') {
+    if (currentUserRole !== 'owner') {
       return;
     }
     if (!activeCode) return;
@@ -830,8 +846,8 @@ export default function CompanySettingsView({
   };
 
   const handleChangeMemberRole = async (memberUserId: string, memberName: string, newRole: 'master_admin' | 'admin' | 'employee') => {
-    if (currentUserRole !== 'owner' && currentUserRole !== 'master_admin') {
-      alert("No tienes permisos suficientes para editar roles. Solo el Dueño o Master Admin pueden modificar roles.");
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede modificar roles.");
       return;
     }
     
@@ -858,19 +874,13 @@ export default function CompanySettingsView({
   };
 
   const handleChangeMemberBranch = async (memberUserId: string, memberName: string, newBranchId: string) => {
-    if (currentUserRole !== 'owner' && currentUserRole !== 'master_admin' && currentUserRole !== 'admin') {
-      alert("No tienes permisos suficientes para asignar sucursales.");
+    if (currentUserRole !== 'owner') {
+      alert("Solo el Dueño puede asignar sucursales.");
       return;
     }
 
     const memberToUpdate = members.find(m => m.userId === memberUserId);
     if (!memberToUpdate) return;
-
-    // Admin can only assign employees, Owner & Master Admin can assign any role
-    if (currentUserRole === 'admin' && memberToUpdate.role !== 'employee') {
-      alert("Como Administrador, solo puedes asignar sucursales a Empleados.");
-      return;
-    }
 
     setIsUpdating(true);
     try {
@@ -1166,7 +1176,7 @@ export default function CompanySettingsView({
                   <h4 className="font-extrabold text-sm text-slate-850">Personal del Comercio</h4>
                   <p className="text-[11px] text-slate-500">Lista de usuarios, roles personalizados y permisos del negocio {companyName}:</p>
                 </div>
-                {(currentUserRole === 'owner' || currentUserRole === 'admin') && (
+                {currentUserRole === 'owner' && (
                   <div className="flex flex-wrap gap-2">
                     <button
                       onClick={() => setIsCredModalOpen(true)}
@@ -1234,13 +1244,13 @@ export default function CompanySettingsView({
                             </div>
                           )}
 
-                          {/* Branch indicator and switching option */}
-                          {member.role !== 'owner' && (currentUserRole === 'owner' || currentUserRole === 'admin') ? (
+                          {/* Branch indicator and switching option — owner-only */}
+                          {member.role !== 'owner' && currentUserRole === 'owner' ? (
                             <div className="mt-2 flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg p-1.5 pr-2 max-w-full">
                               <span className="text-[10px] text-slate-500 font-bold uppercase shrink-0">Sucursal:</span>
                               <select
                                 value={member.assignedBranchId || ''}
-                                disabled={isUpdating || (currentUserRole === 'admin' && member.role !== 'employee')}
+                                disabled={isUpdating}
                                 onChange={(e) => handleChangeMemberBranch(member.userId, member.name, e.target.value)}
                                 className="flex-1 min-w-0 max-w-[180px] text-[11px] bg-white border border-slate-300 hover:border-indigo-400 rounded px-1.5 py-0.5 outline-none font-bold text-slate-700 cursor-pointer truncate"
                               >
@@ -1263,7 +1273,7 @@ export default function CompanySettingsView({
                           <span className="text-[11px] font-black uppercase py-1.5 px-3 rounded-full border bg-indigo-50 border-indigo-200 text-indigo-700 shrink-0 shadow-sm">
                             👑 Dueño
                           </span>
-                        ) : (currentUserRole === 'owner' || currentUserRole === 'master_admin') ? (
+                        ) : currentUserRole === 'owner' ? (
                           <div className="flex flex-wrap items-center gap-2">
                             {/* Role badge (read-only) */}
                             <span className={`text-[11px] font-black uppercase py-1.5 px-3 rounded-full border shrink-0 ${
@@ -1309,8 +1319,8 @@ export default function CompanySettingsView({
                           </div>
                         )}
                         
-                        {/* Remove Employee button */}
-                        {member.role !== 'owner' && (currentUserRole === 'owner' || currentUserRole === 'master_admin' || (currentUserRole === 'admin' && member.role === 'employee')) && (
+                        {/* Remove Employee button — owner-only */}
+                        {member.role !== 'owner' && currentUserRole === 'owner' && (
                           deleteConfirmMemberId === member.userId ? (
                             <button
                               type="button"
@@ -1353,13 +1363,13 @@ export default function CompanySettingsView({
                 <p className="text-[11px] text-slate-500">Genera un código para que colaboradores con <strong>cuenta de Google</strong> se unan a '{companyName}'. Para empleados sin Google, usa "Crear Empleado" en la pestaña Equipo.</p>
               </div>
 
-              {currentUserRole !== 'owner' && currentUserRole !== 'admin' ? (
+              {currentUserRole !== 'owner' ? (
                 <div className="bg-red-50 border border-red-200/50 p-4 rounded-xl flex items-start space-x-3">
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div>
                     <h5 className="font-extrabold text-xs text-red-800">Acceso Denegado</h5>
                     <p className="text-[11px] text-red-600 leading-relaxed">
-                      El generador de códigos de ingreso de personal está estrictamente reservado para administradores y propietarios. Contáctate con tu gerente para modificar accesos.
+                      El generador de códigos de ingreso de personal está estrictamente reservado para el Dueño. Contáctate con tu propietario para modificar accesos.
                     </p>
                   </div>
                 </div>
@@ -1916,13 +1926,13 @@ export default function CompanySettingsView({
                 </p>
               </div>
 
-              {currentUserRole !== 'owner' && currentUserRole !== 'master_admin' ? (
+              {currentUserRole !== 'owner' ? (
                 <div className="bg-red-50 border border-red-200/50 p-4 rounded-xl flex items-start space-x-3">
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div>
                     <h5 className="font-extrabold text-xs text-red-800">Acceso Restringido</h5>
                     <p className="text-[11px] text-red-600">
-                      Solo el Propietario o Master Admin pueden gestionar los respaldos de la nube.
+                      Solo el Dueño puede gestionar los respaldos de la nube.
                     </p>
                   </div>
                 </div>
@@ -2237,12 +2247,16 @@ export default function CompanySettingsView({
                         <label className="text-slate-600 font-bold block">Rol *</label>
                         <select
                           value={credRole}
+                          disabled={currentUserRole !== 'owner'}
                           onChange={(e) => setCredRole(e.target.value as 'master_admin' | 'admin' | 'employee')}
-                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705 cursor-pointer"
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705 cursor-pointer disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         >
                           <option value="employee">💼 Cajero / Empleado</option>
-                          <option value="admin">🛡️ Encargado / Gerente</option>
+                          {currentUserRole === 'owner' && <option value="admin">🛡️ Encargado / Gerente</option>}
                         </select>
+                        {currentUserRole !== 'owner' && (
+                          <p className="text-[9px] text-slate-400 leading-tight">Solo el Dueño puede crear cuentas de Encargado.</p>
+                        )}
                       </div>
 
                       <div className="space-y-1">

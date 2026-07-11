@@ -669,6 +669,11 @@ export default function App() {
   const activeCompanyRole = user && activeCompanyId ? (userCompanies[activeCompanyId]?.role || 'employee') : 'owner';
   // Mirrors firestore.rules isOwnerOrAdmin() — refunds/voids require this client-side too
   const isOwnerOrAdminRole = activeCompanyRole === 'owner' || activeCompanyRole === 'master_admin' || activeCompanyRole === 'admin';
+  // Encargados (admin) manage a single sucursal, same as Cajeros (employee) — only
+  // Owner/master_admin can see/switch between every sucursal of the company. The Owner
+  // still reassigns an Encargado's branch from Mi Empresa/Equipo (Member.assignedBranchId);
+  // that change takes effect here automatically since currentUserMember is a live listener.
+  const isBranchLocked = activeCompanyRole === 'employee' || activeCompanyRole === 'admin';
 
   // True when the logged-in user authenticated with an employee code (virtual email), not Google
   const isCredentialEmployee = Boolean(user?.email?.includes('_') && user?.email?.endsWith('@logicpos.com'));
@@ -1127,19 +1132,19 @@ export default function App() {
     return () => unsubMemberSelf();
   }, [user, activeCompanyId, userCompanies]);
 
-  // Lock the branch selector for employees
+  // Lock the branch selector for employees and encargados (admin) — both manage a single
+  // sucursal; only owner/master_admin can roam across all of them. Re-runs whenever
+  // currentUserMember changes, so an Owner reassigning this user's branch takes effect live.
   useEffect(() => {
     if (!user || !activeCompanyId) return;
 
-    // Check if the current user is an employee
-    const isEmployee = activeCompanyRole === 'employee';
-    if (isEmployee && currentUserMember?.assignedBranchId) {
+    if (isBranchLocked && currentUserMember?.assignedBranchId) {
       if (selectedBranchId !== currentUserMember.assignedBranchId) {
         setSelectedBranchId(currentUserMember.assignedBranchId);
         localStorage.setItem('logic_active_branch', currentUserMember.assignedBranchId);
       }
     }
-  }, [currentUserMember, activeCompanyRole, selectedBranchId, activeCompanyId, user]);
+  }, [currentUserMember, isBranchLocked, selectedBranchId, activeCompanyId, user]);
 
   // Sync state from Firestore
   useEffect(() => {
@@ -3413,7 +3418,7 @@ export default function App() {
             {branches.length > 0 && (
               <div className="mt-1 flex items-center space-x-1 overflow-hidden shrink min-w-0">
                 <span className="text-[9px] lg:text-[10px] font-extrabold uppercase tracking-wider hidden sm:block" style={{ color: 'color-mix(in srgb, var(--brand-primary) 65%, white)' }}>Sucursal:</span>
-                {activeCompanyRole === 'employee' ? (
+                {isBranchLocked ? (
                   <span className="border rounded px-1.5 lg:px-2 py-0.5 text-[9px] lg:text-[10px] font-bold truncate text-white" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 80%, black)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
                     <MapPin className="w-2.5 h-2.5 inline mr-0.5" />{branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal Principal'}
                   </span>

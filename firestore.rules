@@ -46,12 +46,6 @@ service cloud.firestore {
       return isMemberOfCompany(companyId) && getMemberRole(companyId) == 'owner';
     }
 
-    // Role-hierarchy: only 'owner' may grant/keep 'owner' or 'master_admin'; admin/master_admin may only grant 'employee' or 'admin'
-    function isValidRoleGrant(granterRole, newRole) {
-      return granterRole == 'owner'
-          || ((granterRole == 'master_admin' || granterRole == 'admin') && (newRole == 'employee' || newRole == 'admin'));
-    }
-
     // A member's permissions array, used for fine-grained (non-admin) write access
     function hasPermission(companyId, perm) {
       return isOwnerOrAdmin(companyId) ||
@@ -226,7 +220,9 @@ service cloud.firestore {
         // A member document may only be created through one of three legitimate paths:
         //   A) Founder self-claiming 'owner' right after creating their own company doc
         //   B) Self-join backed by a real invitation code matching this company + role
-        //   C) An existing owner/admin directly provisioning a new member (e.g. credential employees)
+        //   C) The owner directly provisioning a new member (e.g. credential employees) —
+        //      Encargado/Master Admin cannot provision anyone; only the real Owner manages
+        //      the team roster (branch reassignment, role grants, new accounts, removal).
         allow create: if isVerifiedUser() && isValidCompanyMember(incoming()) && incoming().userId == memberId && (
           (request.auth.uid == memberId && incoming().role == 'owner' &&
             exists(/databases/$(database)/documents/companies/$(companyId)) &&
@@ -237,25 +233,15 @@ service cloud.firestore {
             get(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)).data.companyId == companyId &&
             get(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)).data.role == incoming().role)
           ||
-          (request.auth.uid != memberId && isMemberOfCompany(companyId) &&
-            isValidRoleGrant(getMemberRole(companyId), incoming().role))
+          (request.auth.uid != memberId && isOwner(companyId))
         );
 
-        // Updating a member: owner can do anything; admin/master_admin can only touch members
-        // who are currently 'employee' or 'admin', and may only grant 'employee' or 'admin'
-        allow update: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidCompanyMember(incoming()) &&
-          incoming().userId == memberId && existing().userId == memberId && (
-            getMemberRole(companyId) == 'owner' ||
-            (isValidRoleGrant(getMemberRole(companyId), incoming().role) &&
-              existing().role != 'owner' && existing().role != 'master_admin')
-          );
+        // Updating a member (branch reassignment, role change, permissions) — owner-only.
+        allow update: if isVerifiedUser() && isValidCompanyMember(incoming()) &&
+          incoming().userId == memberId && existing().userId == memberId && isOwner(companyId);
 
-        // Deleting/removing a member: owner can remove anyone; admin/master_admin only employee/admin targets
-        allow delete: if isVerifiedUser() && isMemberOfCompany(companyId) && (
-          getMemberRole(companyId) == 'owner' ||
-          ((getMemberRole(companyId) == 'master_admin' || getMemberRole(companyId) == 'admin') &&
-            existing().role != 'owner' && existing().role != 'master_admin')
-        );
+        // Deleting/removing a member — owner-only.
+        allow delete: if isVerifiedUser() && isOwner(companyId);
       }
 
       // Products subcollection inside Company
@@ -343,10 +329,12 @@ service cloud.firestore {
     match /invitationCodes/{code} {
       allow get: if isSignedIn();
       allow list: if false; // Deny standard listing for security
-      // Only an owner/admin of the target company may mint or modify an invite for it
+      // Only the Owner of the target company may mint or modify an invite for it — an
+      // Encargado/Master Admin minting one would bypass the members-collection role-grant
+      // restriction above (the invite's stored role is trusted as-is on self-join).
       allow create, update: if isVerifiedUser() && isValidInvitationCode(incoming()) && incoming().code == code
-        && isOwnerOrAdmin(incoming().companyId);
-      allow delete: if isVerifiedUser() && isOwnerOrAdmin(resource.data.companyId);
+        && isOwner(incoming().companyId);
+      allow delete: if isVerifiedUser() && isOwner(resource.data.companyId);
     }
 
   }
