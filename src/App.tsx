@@ -4009,9 +4009,9 @@ export default function App() {
                               <p className="text-[9px] text-slate-400 font-mono italic">{tx.time}</p>
                             </div>
                             <span className={`font-mono font-black text-[10px] px-2 py-0.5 rounded ${
-                              tx.type === 'Ingreso' ? 'bg-emerald-50 text-emerald-800' : tx.type === 'Transferencia' ? 'bg-sky-50 text-sky-700' : 'bg-rose-50 text-rose-800'
+                              tx.type === 'Ingreso' || tx.type === 'Venta' ? 'bg-emerald-50 text-emerald-800' : tx.type === 'Transferencia' ? 'bg-sky-50 text-sky-700' : 'bg-rose-50 text-rose-800'
                             }`}>
-                              {tx.type === 'Ingreso' ? '+' : tx.type === 'Transferencia' ? '' : '-'}{formatTxAmount(tx)}
+                              {tx.type === 'Egreso' ? '-' : tx.type === 'Transferencia' ? '' : '+'}{formatTxAmount(tx)}
                             </span>
                           </div>
                         ))}
