@@ -348,6 +348,21 @@ export const getSaleMonthKey = (sale: Sale): string => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 };
 
+// Same idea as getSaleMonthKey, but a "YYYY-MM-DD" bucket for the daily cut (Corte Diario).
+export const getSaleDayKey = (sale: Sale): string => {
+  const ms = sale.createdAt ?? Date.parse(sale.timestamp);
+  const d = isNaN(ms) ? new Date() : new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// Same "YYYY-MM-DD" bucketing as getSaleDayKey, but for a raw epoch-ms timestamp — used to
+// place cashRegister.transactions / stockMovements entries (which only carry `createdAt`,
+// not a Sale) into the Corte Diario.
+const msToDayKey = (ms: number): string => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
 export const getMonthLabel = (monthKey: string): string => {
   const [y, m] = monthKey.split('-').map(Number);
   return `${MONTH_NAMES_ES[(m - 1 + 12) % 12]} ${y}`;
@@ -647,6 +662,12 @@ export default function App() {
     currentCash: 2000,
     transactions: [{ type: 'Ingreso', amount: 2000, description: 'Apertura de Caja', time: new Date().toLocaleTimeString() }]
   });
+
+  // What the various cash-register widgets show — once the turno is closed, `currentCash`
+  // still holds the real closing balance for audit/history purposes, but showing that number
+  // next to a "Caja Cerrada" badge reads as if there were still an active balance in the
+  // drawer, which confuses staff. Display 0 instead until the next Apertura sets a real one.
+  const displayedCash = cashRegister.isOpen ? cashRegister.currentCash : 0;
 
   // Ad-hoc Custom Categories state
   const [customCategories, setCustomCategories] = useState<string[]>(() => {
@@ -1489,6 +1510,21 @@ export default function App() {
   // that has never had its register opened yet still gets a doc instead of erroring.
   const applyCashDelta = async (branchId: string, amountDelta: number, txEntries: CashRegister['transactions']) => {
     if (!user || !activeCompanyId || !branchId) return;
+
+    // Optimistic local update, mirroring writeCashRegisterForBranch's pattern (abrir/cerrar
+    // caja already feels instant because of this) — only when the delta is for the branch
+    // currently on screen: applyCashDelta is also used for refunds of sales made at a
+    // *different* branch (sale.branchId), and touching `cashRegister` for a branch that
+    // isn't selectedBranchId would show the wrong branch's numbers. The onSnapshot listener's
+    // later authoritative read fully replaces this state, so there's no double-counting risk.
+    if (branchId === selectedBranchId) {
+      setCashRegister(prev => ({
+        ...prev,
+        currentCash: prev.currentCash + amountDelta,
+        transactions: [...prev.transactions, ...txEntries],
+      }));
+    }
+
     try {
       await setDoc(doc(db, 'companies', activeCompanyId, 'cashRegisters', branchId), {
         currentCash: increment(amountDelta),
@@ -2620,6 +2656,186 @@ export default function App() {
     await saveFileOnDevice(`corte_mensual_${branchName.replace(/[^a-zA-Z0-9]/g, '_')}_${pdfCutMonth}.pdf`, pdfBase64, 'application/pdf');
   };
 
+  // Corte Diario (PDF) — same structure/detail level as handleDownloadMonthlyCutPdf above,
+  // but scoped to a single day (`statsDay`) instead of a month, plus a Top 5 products table.
+  // Fully independent from the monthly cut: separate state, separate function, doesn't touch it.
+  const handleDownloadDailyCutPdf = async () => {
+    if (!statsDay) return;
+    const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
+    const branchName = branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal';
+    const companyName = branding.displayName || userCompanies[activeCompanyId || '']?.name || 'Mi Comercio';
+
+    const daySales = sales
+      .filter(s =>
+        (s.branchId === selectedBranchId || (!s.branchId && isSelectedMatriz)) &&
+        getSaleDayKey(s) === statsDay
+      )
+      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+
+    const completedSales = daySales.filter(s => s.status === 'Completed');
+    const refundedSales = daySales.filter(s => s.status === 'Refunded');
+    const grossRevenue = completedSales.reduce((acc, s) => acc + s.total, 0);
+    const totalDiscount = completedSales.reduce((acc, s) => acc + (s.discount || 0), 0);
+    const totalTax = completedSales.reduce((acc, s) => acc + (s.tax || 0), 0);
+    const refundedTotal = refundedSales.reduce((acc, s) => acc + s.total, 0);
+
+    const paymentLabels: Record<Sale['paymentMethod'], string> = { Cash: 'Efectivo', Card: 'Tarjeta', Transfer: 'Transferencia', Credit: 'Crédito (Fiado)' };
+    const byPaymentMethod: Record<string, { count: number; total: number }> = {};
+    completedSales.forEach(s => {
+      const key = paymentLabels[s.paymentMethod];
+      if (!byPaymentMethod[key]) byPaymentMethod[key] = { count: 0, total: 0 };
+      byPaymentMethod[key].count += 1;
+      byPaymentMethod[key].total += s.total;
+    });
+
+    const dayCashMovements = cashRegister.transactions
+      .filter((tx): tx is typeof tx & { createdAt: number } =>
+        (tx.type === 'Ingreso' || tx.type === 'Egreso') &&
+        tx.createdAt !== undefined && msToDayKey(tx.createdAt) === statsDay
+      )
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const totalIngresos = dayCashMovements.filter(t => t.type === 'Ingreso').reduce((acc, t) => acc + t.amount, 0);
+    const totalEgresos = dayCashMovements.filter(t => t.type === 'Egreso').reduce((acc, t) => acc + t.amount, 0);
+
+    const dayStockMovements = stockMovements
+      .filter(m => m.branchId === selectedBranchId && msToDayKey(m.createdAt) === statsDay)
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const stockTypeLabel = (t: StockMovement['type']) =>
+      t === 'surtido' ? 'Surtido' : t === 'merma' ? 'Merma/Ajuste' : t === 'transfer_in' ? 'Traspaso entrada' : 'Traspaso salida';
+
+    const topProducts = dailyTopProducts;
+
+    const doc = new jsPDF();
+    const dayLabel = new Date(`${statsDay}T00:00:00`).toLocaleDateString('es-MX', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+    doc.setFontSize(16);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Corte Diario de Ventas', 14, 18);
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    doc.text(`${companyName} — ${branchName}`, 14, 25);
+    doc.text(`Día: ${dayLabel}`, 14, 31);
+    doc.text(`Generado: ${new Date().toLocaleString()}`, 14, 37);
+
+    autoTable(doc, {
+      startY: 44,
+      theme: 'grid',
+      head: [['Resumen del día', '']],
+      body: [
+        ['Ventas completadas', String(completedSales.length)],
+        ['Ingreso total del día', formatMXN(grossRevenue)],
+        ['Descuentos aplicados', formatMXN(totalDiscount)],
+        ['Impuestos cobrados', formatMXN(totalTax)],
+        ['Ventas reembolsadas', `${refundedSales.length} (${formatMXN(refundedTotal)})`],
+        ...Object.entries(byPaymentMethod).map(([label, v]) => [`  · ${label}`, `${v.count} — ${formatMXN(v.total)}`]),
+        ['Entradas de efectivo (manuales)', `${dayCashMovements.filter(t => t.type === 'Ingreso').length} (${formatMXN(totalIngresos)})`],
+        ['Retiros de efectivo (manuales)', `${dayCashMovements.filter(t => t.type === 'Egreso').length} (${formatMXN(totalEgresos)})`],
+      ],
+      styles: { fontSize: 9 },
+      headStyles: { fillColor: [51, 65, 85] },
+      columnStyles: { 1: { halign: 'right' } },
+    });
+
+    const finalY = (doc as any).lastAutoTable?.finalY ?? 90;
+
+    if (daySales.length > 0) {
+      autoTable(doc, {
+        startY: finalY + 8,
+        head: [['Fecha', 'Folio', 'Cliente', 'Cajero', 'Método', 'Total', 'Estado']],
+        body: daySales.map(s => [
+          s.timestamp,
+          s.id,
+          s.customerName || 'Público General',
+          s.employeeName || '—',
+          paymentLabels[s.paymentMethod],
+          formatMXN(s.total),
+          s.status === 'Completed' ? 'Completada' : 'Reembolsada'
+        ]),
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [51, 65, 85] },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index === 6 && data.cell.raw === 'Reembolsada') {
+            data.cell.styles.textColor = [190, 30, 60];
+          }
+        }
+      });
+    } else {
+      doc.setFontSize(10);
+      doc.text('No hay ventas registradas para este día.', 14, finalY + 10);
+    }
+
+    const finalY2 = daySales.length > 0 ? ((doc as any).lastAutoTable?.finalY ?? finalY + 20) : finalY + 16;
+
+    if (dayCashMovements.length > 0) {
+      doc.setFontSize(11);
+      doc.setFont('helvetica', 'bold');
+      doc.text('Entradas y Retiros de Efectivo (manuales)', 14, finalY2 + 10);
+      autoTable(doc, {
+        startY: finalY2 + 14,
+        head: [['Hora', 'Tipo', 'Descripción', 'Monto']],
+        body: dayCashMovements.map(t => [
+          t.time,
+          t.type === 'Ingreso' ? 'Entrada' : 'Retiro',
+          t.description,
+          formatMXN(t.amount)
+        ]),
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [51, 65, 85] },
+        columnStyles: { 3: { halign: 'right' } },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index === 1) {
+            data.cell.styles.textColor = data.cell.raw === 'Entrada' ? [16, 122, 87] : [190, 30, 60];
+          }
+        }
+      });
+    }
+
+    const finalY3 = dayCashMovements.length > 0 ? ((doc as any).lastAutoTable?.finalY ?? finalY2 + 20) : finalY2;
+
+    if (topProducts.length > 0) {
+      doc.setFontSize(11);
+      doc.setFont('helvetica', 'bold');
+      doc.text('Top 5 Artículos Más Vendidos', 14, finalY3 + 12);
+      autoTable(doc, {
+        startY: finalY3 + 16,
+        head: [['#', 'Producto', 'Unidades vendidas']],
+        body: topProducts.map((p, idx) => [String(idx + 1), p.name, String(p.quantity)]),
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [51, 65, 85] },
+        columnStyles: { 2: { halign: 'right' } },
+      });
+    }
+
+    const finalY4 = topProducts.length > 0 ? ((doc as any).lastAutoTable?.finalY ?? finalY3 + 20) : finalY3;
+
+    if (dayStockMovements.length > 0) {
+      doc.setFontSize(11);
+      doc.setFont('helvetica', 'bold');
+      doc.text('Movimientos de Inventario (surtidos y traspasos)', 14, finalY4 + 12);
+      autoTable(doc, {
+        startY: finalY4 + 16,
+        head: [['Hora', 'Producto', 'Tipo', 'Origen/Destino', 'Unidades']],
+        body: dayStockMovements.map(m => {
+          const isIn = m.type === 'surtido' || m.type === 'transfer_in';
+          return [
+            m.timestamp,
+            m.productName,
+            stockTypeLabel(m.type),
+            m.counterpartBranchName ? `${isIn ? 'desde' : 'hacia'} ${m.counterpartBranchName}` : '—',
+            `${isIn ? '+' : '-'}${m.quantity}`
+          ];
+        }),
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [51, 65, 85] },
+        columnStyles: { 4: { halign: 'right' } },
+      });
+    }
+
+    const pdfDataUri = doc.output('datauristring');
+    const pdfBase64 = pdfDataUri.split('base64,')[1];
+    await saveFileOnDevice(`corte_diario_${branchName.replace(/[^a-zA-Z0-9]/g, '_')}_${statsDay}.pdf`, pdfBase64, 'application/pdf');
+  };
+
   // Branch Office (Sucursal) State & Forms
   const [isBranchModalOpen, setIsBranchModalOpen] = useState(false);
   const [editingBranch, setEditingBranch] = useState<Branch | null>(null);
@@ -2812,6 +3028,10 @@ export default function App() {
   };
 
   const handleOpenBranchModal = (branch?: Branch) => {
+    if (branch && activeCompanyRole !== 'owner') {
+      alert('Solo el Dueño puede editar sucursales existentes.');
+      return;
+    }
     if (branch) {
       setEditingBranch(branch);
       setBranchForm({
@@ -2861,6 +3081,10 @@ export default function App() {
   };
 
   const handleDeleteBranch = async (bId: string) => {
+    if (activeCompanyRole !== 'owner') {
+      alert('Solo el Dueño puede eliminar sucursales.');
+      return;
+    }
     if (branches.length <= 1) {
       alert('Debe haber al menos una sucursal registrada en el sistema.');
       return;
@@ -3164,10 +3388,13 @@ export default function App() {
 
   // Statistics month scope: 'all' shows all-time totals, otherwise a specific "YYYY-MM"
   const [statsMonth, setStatsMonth] = useState<string>(getCurrentMonthKey());
+  // Corte Diario: a specific "YYYY-MM-DD" day, or '' to fall back to statsMonth/histórico.
+  // Takes priority over statsMonth in the `stats` useMemo below whenever it's set.
+  const [statsDay, setStatsDay] = useState<string>('');
   // Month scope for the "Corte Mensual (PDF)" export in Historial/Caja
   const [pdfCutMonth, setPdfCutMonth] = useState<string>(getCurrentMonthKey());
   
-  const handleRecordCashFlow = (type: 'Ingreso' | 'Egreso') => {
+  const handleRecordCashFlow = async (type: 'Ingreso' | 'Egreso') => {
     const val = parseFloat(cashFlowAmount);
     if (isNaN(val) || val <= 0) {
       alert('Ingresa un valor válido.');
@@ -3179,17 +3406,22 @@ export default function App() {
     }
 
     const valueSigned = type === 'Ingreso' ? val : -val;
-    applyCashDelta(selectedBranchId, valueSigned, [{
-      type,
-      amount: val,
-      description: cashFlowDesc,
-      time: new Date().toLocaleTimeString(),
-      createdAt: Date.now(),
-      branchId: selectedBranchId
-    }]);
-    setCashFlowAmount('');
-    setCashFlowDesc('');
-    alert(`Registo de ${type} en caja de ${formatMXN(val)} guardado.`);
+    try {
+      await applyCashDelta(selectedBranchId, valueSigned, [{
+        type,
+        amount: val,
+        description: cashFlowDesc,
+        time: new Date().toLocaleTimeString(),
+        createdAt: Date.now(),
+        branchId: selectedBranchId
+      }]);
+      setCashFlowAmount('');
+      setCashFlowDesc('');
+      alert(`Registro de ${type} en caja de ${formatMXN(val)} guardado.`);
+    } catch (err) {
+      console.error('Error recording cash flow:', err);
+      alert(`No se pudo guardar el ${type.toLowerCase()} en caja. Verifica tu conexión e intenta de nuevo.`);
+    }
   };
 
 
@@ -3222,10 +3454,12 @@ export default function App() {
 
   const stats = useMemo(() => {
     const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
+    // Corte Diario: statsDay takes priority over statsMonth whenever it's set. Leaving it
+    // empty ('') keeps the existing month/histórico behavior completely unchanged.
     const activeSales = sales.filter(s =>
       s.status === 'Completed' &&
       (s.branchId === selectedBranchId || (!s.branchId && isSelectedMatriz)) &&
-      (statsMonth === 'all' || getSaleMonthKey(s) === statsMonth)
+      (statsDay ? getSaleDayKey(s) === statsDay : (statsMonth === 'all' || getSaleMonthKey(s) === statsMonth))
     );
     const grossRevenue = activeSales.reduce((acc, s) => acc + s.total, 0);
     const cost = activeSales.reduce((acc, s) => {
@@ -3254,8 +3488,40 @@ export default function App() {
       });
     });
 
-    return { grossRevenue, profit, averageTicket, lowStockItems, categoryPopularity, activeSalesCount: activeSales.length };
-  }, [sales, products, selectedBranchId, branches, statsMonth]);
+    return { grossRevenue, profit, averageTicket, lowStockItems, categoryPopularity, activeSalesCount: activeSales.length, activeSales };
+  }, [sales, products, selectedBranchId, branches, statsMonth, statsDay]);
+
+  // Corte Diario — manual cash movements (Ingreso/Egreso) for the selected day, from the
+  // currently-displayed branch's register. Only computed when a day is actually selected.
+  const dailyCashFlow = useMemo(() => {
+    if (!statsDay) return null;
+    const movements = cashRegister.transactions.filter((tx): tx is typeof tx & { createdAt: number } =>
+      (tx.type === 'Ingreso' || tx.type === 'Egreso') &&
+      tx.createdAt !== undefined && msToDayKey(tx.createdAt) === statsDay
+    );
+    const totalIngresos = movements.filter(t => t.type === 'Ingreso').reduce((acc, t) => acc + t.amount, 0);
+    const totalEgresos = movements.filter(t => t.type === 'Egreso').reduce((acc, t) => acc + t.amount, 0);
+    return { movements, totalIngresos, totalEgresos, net: totalIngresos - totalEgresos };
+  }, [cashRegister.transactions, statsDay]);
+
+  // Corte Diario — top 5 best-selling products for the selected day (by units), from
+  // stats.activeSales (already day-filtered above). Day-only per product decision; the
+  // month/histórico view doesn't have an equivalent card.
+  const dailyTopProducts = useMemo(() => {
+    if (!statsDay) return [];
+    const totals = new Map<string, { productId: string; name: string; quantity: number }>();
+    stats.activeSales.forEach(s => {
+      s.items.forEach(item => {
+        const existing = totals.get(item.productId);
+        if (existing) {
+          existing.quantity += item.quantity;
+        } else {
+          totals.set(item.productId, { productId: item.productId, name: item.name, quantity: item.quantity });
+        }
+      });
+    });
+    return Array.from(totals.values()).sort((a, b) => b.quantity - a.quantity).slice(0, 5);
+  }, [stats.activeSales, statsDay]);
 
   // Inline style for active nav buttons — adapts to brand palette
   const navActiveStyle: React.CSSProperties = {
@@ -3442,7 +3708,7 @@ export default function App() {
         <div className="flex items-center space-x-2 lg:space-x-4 flex-shrink-0">
           <div className="hidden lg:flex items-center space-x-2 text-sm font-medium opacity-90">
             <span className="px-2.5 py-1 rounded-md border font-bold text-white text-xs" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 60%, transparent)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
-              Caja Registradora: {formatMXN(cashRegister.currentCash)}
+              Caja Registradora: {formatMXN(displayedCash)}
             </span>
             <span className="text-xs px-2 py-1 rounded border font-semibold text-white" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 50%, transparent)', borderColor: 'color-mix(in srgb, var(--brand-primary) 25%, transparent)' }}>
               {nowStr}
@@ -3924,7 +4190,7 @@ export default function App() {
                       </div>
                       <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl space-y-1 text-left">
                         <span className="text-[9px] text-indigo-500 font-black uppercase">Efectivo Sugerido (Sistema)</span>
-                        <p className="text-sm font-black text-indigo-750 font-mono">{formatMXN(cashRegister.currentCash)}</p>
+                        <p className="text-sm font-black text-indigo-750 font-mono">{formatMXN(displayedCash)}</p>
                       </div>
                     </div>
 
@@ -4675,7 +4941,7 @@ export default function App() {
                 <div className="md:col-span-4 space-y-1">
                   <span className="text-[10px] font-extrabold py-1 px-3 rounded-full uppercase tracking-wider" style={{ color: 'color-mix(in srgb, var(--brand-primary) 45%, white)', backgroundColor: 'color-mix(in srgb, var(--brand-dark) 40%, black)' }}>Caja Activa (Flujo del día)</span>
                   <p className="text-2xl font-extrabold">Efectivo en Caja</p>
-                  <p className="text-3xl font-black text-yellow-400">{formatMXN(cashRegister.currentCash)}</p>
+                  <p className="text-3xl font-black text-yellow-400">{formatMXN(displayedCash)}</p>
                   {editInitialCashPrompt ? (
                     <div className="flex items-center gap-2 mt-2">
                        <span className="text-xs text-white/60">Monto apertura: $</span>
@@ -4949,7 +5215,7 @@ export default function App() {
                     <div className="space-y-3">
                       <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-100 flex justify-between items-center text-xs">
                         <span className="text-slate-500 font-extrabold uppercase tracking-wider">Monto Efectivo Estimado en Caja Física:</span>
-                        <span className="font-extrabold text-indigo-700 text-sm">{formatMXN(cashRegister.currentCash)}</span>
+                        <span className="font-extrabold text-indigo-700 text-sm">{formatMXN(displayedCash)}</span>
                       </div>
                       <div className="space-y-2.5">
                         {branchScopedTransactions.map((tx, idx) => {
@@ -5078,24 +5344,52 @@ export default function App() {
                   </h2>
                   <p className="text-xs text-slate-500">Métricas completas, ganancias aproximadas y tickets logrados por mes.</p>
                 </div>
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto flex-wrap">
                   <select
                     value={statsMonth}
                     onChange={(e) => setStatsMonth(e.target.value)}
-                    className="w-full sm:w-auto text-xs font-bold text-slate-700 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 outline-none focus:border-indigo-400 cursor-pointer"
+                    disabled={!!statsDay}
+                    className="w-full sm:w-auto text-xs font-bold text-slate-700 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 outline-none focus:border-indigo-400 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <option value="all">Todo el histórico</option>
                     {availableStatsMonths.map(m => (
                       <option key={m} value={m}>{getMonthLabel(m)}</option>
                     ))}
                   </select>
-                  <button
-                    type="button"
-                    onClick={handleDownloadDashboard}
-                    className="w-full sm:w-auto px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs rounded-xl shadow-md flex items-center justify-center gap-2 transition cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5" /><span>Descargar Reporte (CSV)</span>
-                  </button>
+                  {/* Corte Diario: selecting a day takes priority over the month select above
+                      (see the `stats` useMemo) — "Limpiar" drops back to the month/histórico view. */}
+                  <input
+                    type="date"
+                    value={statsDay}
+                    onChange={(e) => setStatsDay(e.target.value)}
+                    className="w-full sm:w-auto text-xs font-bold text-slate-700 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 outline-none focus:border-indigo-400 cursor-pointer"
+                  />
+                  {statsDay && (
+                    <button
+                      type="button"
+                      onClick={() => setStatsDay('')}
+                      className="w-full sm:w-auto px-3 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-600 font-black text-xs rounded-xl transition cursor-pointer"
+                    >
+                      Limpiar
+                    </button>
+                  )}
+                  {statsDay ? (
+                    <button
+                      type="button"
+                      onClick={handleDownloadDailyCutPdf}
+                      className="w-full sm:w-auto px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs rounded-xl shadow-md flex items-center justify-center gap-2 transition cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" /><span>Descargar Corte del Día (PDF)</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleDownloadDashboard}
+                      className="w-full sm:w-auto px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs rounded-xl shadow-md flex items-center justify-center gap-2 transition cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" /><span>Descargar Reporte (CSV)</span>
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -5140,9 +5434,61 @@ export default function App() {
 
               </div>
 
+              {/* Corte Diario — only shown once a specific day is selected above */}
+              {statsDay && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="bg-white rounded-2xl border p-5 shadow-sm space-y-4">
+                    <div>
+                      <h3 className="font-extrabold text-slate-800 text-sm">Flujo de Efectivo del Día</h3>
+                      <p className="text-slate-400 text-xs mt-0.5">Entradas y retiros manuales de caja registrados el {statsDay}.</p>
+                    </div>
+                    {!dailyCashFlow || dailyCashFlow.movements.length === 0 ? (
+                      <p className="text-xs text-slate-500 font-semibold py-6 text-center">Sin movimientos manuales de caja este día.</p>
+                    ) : (
+                      <div className="space-y-2.5">
+                        <div className="flex justify-between text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-xl p-2.5">
+                          <span>Entradas (Ingreso)</span>
+                          <span>+{formatMXN(dailyCashFlow.totalIngresos)}</span>
+                        </div>
+                        <div className="flex justify-between text-xs font-bold text-rose-700 bg-rose-50 border border-rose-100 rounded-xl p-2.5">
+                          <span>Retiros (Egreso)</span>
+                          <span>-{formatMXN(dailyCashFlow.totalEgresos)}</span>
+                        </div>
+                        <div className="flex justify-between text-sm font-black text-slate-800 border-t pt-2.5">
+                          <span>Neto del día</span>
+                          <span>{formatMXN(dailyCashFlow.net)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-white rounded-2xl border p-5 shadow-sm space-y-4">
+                    <div>
+                      <h3 className="font-extrabold text-slate-800 text-sm">Artículos Más Vendidos</h3>
+                      <p className="text-slate-400 text-xs mt-0.5">Top 5 productos por unidades vendidas el {statsDay}.</p>
+                    </div>
+                    {dailyTopProducts.length === 0 ? (
+                      <p className="text-xs text-slate-500 font-semibold py-6 text-center">Sin ventas registradas este día.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {dailyTopProducts.map((p, idx) => (
+                          <div key={p.productId} className="flex items-center justify-between bg-slate-50 border border-slate-100 rounded-xl p-2.5">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="text-[10px] font-black text-slate-400 w-4 shrink-0">#{idx + 1}</span>
+                              <span className="text-xs font-bold text-slate-700 truncate">{p.name}</span>
+                            </div>
+                            <span className="text-xs font-black shrink-0" style={{ color: 'var(--brand-primary)' }}>{p.quantity} uds.</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Graphical Charts Section */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                
+
                 {/* Sale split by Category Bar graphical card */}
                 <div className="bg-white rounded-2xl border p-5 shadow-sm space-y-4">
                   <div>
@@ -5321,20 +5667,24 @@ export default function App() {
                       </div>
 
                       <div className="mt-5 pt-3 border-t border-slate-100 flex items-center justify-between gap-2 text-xs">
-                        {!isActive ? (
+                        {!isActive && !isBranchLocked ? (
                           <button
                             onClick={() => handleSelectBranch(branch.id)}
                             className="px-3 py-1.5 bg-slate-100 hover:bg-teal-50 hover:text-teal-700 border border-slate-250 hover:border-teal-200 text-slate-700 font-bold rounded-lg cursor-pointer transition text-[10px]"
                           >
                             Hacer Activa
                           </button>
+                        ) : !isActive ? (
+                          <span className="text-[9px] text-slate-400 font-bold select-none py-1">
+                            🔒 Solo el Dueño
+                          </span>
                         ) : (
                           <span className="text-teal-600 font-bold text-[10px] flex items-center">
                             <Check className="w-3.5 h-3.5 mr-1 bg-teal-100 rounded-full p-0.5" /> Selección Actual
                           </span>
                         )}
 
-                        {activeCompanyRole !== 'employee' ? (
+                        {activeCompanyRole === 'owner' ? (
                           <div className="flex space-x-1">
                             <button
                               onClick={() => handleOpenBranchModal(branch)}
@@ -5352,7 +5702,7 @@ export default function App() {
                           </div>
                         ) : (
                           <span className="text-[9px] text-slate-400 font-bold select-none py-1">
-                            🛡️ Solo Admins
+                            🔒 Solo el Dueño
                           </span>
                         )}
                       </div>
@@ -6964,12 +7314,21 @@ export default function App() {
       {isOpeningCajaModalOpen && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-sm p-6 space-y-4">
-            <div className="pb-2 border-b">
-              <h3 className="font-extrabold text-lg text-slate-800 flex items-center">
-                <Store className="w-5 h-5 mr-2 text-indigo-600 animate-pulse" />
-                Apertura de Turno y Caja
-              </h3>
-              <p className="text-[10px] text-slate-400 mt-0.5">Define el monto inicial en efectivo para iniciar las operaciones del día.</p>
+            <div className="pb-2 border-b flex justify-between items-start gap-2">
+              <div>
+                <h3 className="font-extrabold text-lg text-slate-800 flex items-center">
+                  <Store className="w-5 h-5 mr-2 text-indigo-600 animate-pulse" />
+                  Apertura de Turno y Caja
+                </h3>
+                <p className="text-[10px] text-slate-400 mt-0.5">Define el monto inicial en efectivo para iniciar las operaciones del día.</p>
+              </div>
+              <button
+                onClick={() => setIsOpeningCajaModalOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition shrink-0"
+                title="Salir sin abrir caja"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
 
             <div className="space-y-3.5 text-xs font-semibold text-slate-700">
