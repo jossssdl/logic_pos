@@ -1327,6 +1327,20 @@ export default function CompanySettingsView({
                               onClick={async () => {
                                 try {
                                   await deleteDoc(doc(db, 'companies', companyId, 'members', member.userId));
+                                  // Best-effort: also clear this company out of the departing
+                                  // member's own users/{uid} profile cache, so it doesn't sit
+                                  // orphaned forever. Only succeeds (per firestore.rules) when
+                                  // they belonged to exactly this one company — harmless no-op
+                                  // otherwise, since the members-doc delete above is what
+                                  // actually revokes their access either way.
+                                  try {
+                                    await updateDoc(doc(db, 'users', member.userId), {
+                                      companies: {},
+                                      activeCompanyId: null,
+                                    });
+                                  } catch (cleanupErr) {
+                                    console.warn("Could not clean up departing member's user profile cache:", cleanupErr);
+                                  }
                                   setDeleteConfirmMemberId(null);
                                 } catch (e) {
                                   console.error("Error deleting member:", e);

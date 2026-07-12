@@ -162,7 +162,24 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if isSignedIn() && request.auth.uid == userId;
       allow create: if isVerifiedUser() && request.auth.uid == userId && isValidUser(incoming());
-      allow update: if isVerifiedUser() && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isVerifiedUser() && isValidUser(incoming()) && (
+        request.auth.uid == userId
+        ||
+        // An Owner cleaning up a departing member's cross-reference right after deleting
+        // companies/{companyId}/members/{userId}: that member doc is the source of truth for
+        // access, but users/{userId} also caches a `companies` map for fast lookups, and only
+        // the user themselves could normally touch their own doc — leaving it stale forever
+        // otherwise. Scoped tight: only fires when the target belonged to exactly the one
+        // company being revoked (true for the credential employees this is meant for; a user
+        // in multiple companies needs the extra ones cleared by hand), the actor genuinely
+        // owns that company, and the write only touches companies/activeCompanyId.
+        (
+          'companies' in existing() && existing().companies.keys().size() == 1 &&
+          isOwner(existing().companies.keys()[0]) &&
+          incoming().companies.size() == 0 &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['companies', 'activeCompanyId'])
+        )
+      );
       allow delete: if isVerifiedUser() && request.auth.uid == userId;
 
       // Legacy collections (Backwards compatibility)
