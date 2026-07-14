@@ -3222,8 +3222,14 @@ export default function App() {
   // invoice as facturado/pendiente here can never overwrite the active branch's live sales
   // state via saveAllData.
   const [invoiceSales, setInvoiceSales] = useState<Sale[]>([]);
+  // Same throttle as branchRevenueFetchedAtRef above: skip refetching if someone leaves and
+  // re-enters this tab within 10 minutes — avoids repeatedly paying for the whole company's
+  // invoice-flagged sales just from someone checking back and forth.
+  const invoiceSalesFetchedAtRef = useRef(0);
   useEffect(() => {
     if (activeTab !== 'invoicing' || !user || !activeCompanyId) return;
+    if (Date.now() - invoiceSalesFetchedAtRef.current < 10 * 60 * 1000) return;
+    invoiceSalesFetchedAtRef.current = Date.now();
     let cancelled = false;
     const compId = activeCompanyId;
     (async () => {
