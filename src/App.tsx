@@ -386,6 +386,19 @@ export default function App() {
   const [branding, setBranding] = useState<Branding>({});
   const [printConfig, setPrintConfig] = useState<PrintConfig>(DEFAULT_PRINT_CONFIG);
 
+  // Preloaded logo for the iOS canvas-based ticket image (see printHtmlTicket) — loaded
+  // ahead of time so printing never has to wait on an image load before calling
+  // navigator.share(), which must fire within iOS's "recent user gesture" window.
+  // crossOrigin lets a same-origin canvas draw it without tainting (blocking toDataURL()).
+  const logoImgRef = useRef<HTMLImageElement | null>(null);
+  useEffect(() => {
+    if (!branding.logoUrl) { logoImgRef.current = null; return; }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = branding.logoUrl;
+    logoImgRef.current = img;
+  }, [branding.logoUrl]);
+
   // Selected Bluetooth thermal printer (e.g. MERION PT-B1). Tied to this physical device, not
   // the company/account, so it's kept in localStorage rather than Firestore.
   const [bluetoothPrinter, setBluetoothPrinter] = useState<BluetoothPrinterDevice | null>(() => {
@@ -1114,6 +1127,12 @@ export default function App() {
         setUserCompanies({});
       }
     }, (error) => {
+      // If the listener subscription itself fails (not just a read inside
+      // bootstrapCredentialEmployee — e.g. a transient permission error right after sign-in,
+      // before the auth token is fully settled), a credential employee would otherwise be
+      // stuck on the waiting screen forever with no path to the "Reintentar" button, since
+      // that button only gets armed by bootstrapCredentialEmployee's own retry exhaustion.
+      if (isVirtualEmployee) setCredentialBootstrapFailed(true);
       handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
     });
 
@@ -2004,33 +2023,119 @@ export default function App() {
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     if (isIOS && typeof navigator.share === 'function') {
       try {
-        // .innerText needs layout, which only computes on elements actually in the DOM —
-        // attach briefly just to read it back out, synchronously, no rendering/rasterizing.
-        const textContainer = document.createElement('div');
-        textContainer.style.cssText = 'position:fixed; left:-10000px; top:0; white-space:pre-wrap;';
-        textContainer.innerHTML = ticketBodyHtml;
-        document.body.appendChild(textContainer);
-        const lines = (textContainer.innerText || textContainer.textContent || '')
-          .split('\n')
-          .map(l => l.trim())
-          .filter(Boolean);
-        textContainer.remove();
+        const container = document.createElement('div');
+        container.style.cssText = 'position:fixed; left:-10000px; top:0;';
+        container.innerHTML = ticketBodyHtml;
+        document.body.appendChild(container);
+
+        // Walk the same ticket markup already used everywhere else (header/rows/separators/
+        // signature lines) into draw instructions, reusing the exact structure and wording
+        // already proven correct — just rendered with plain Canvas 2D instead of the DOM
+        // rasterizer that caused the freeze (see note above).
+        type DrawLine =
+          | { kind: 'text'; text: string; center: boolean; bold: boolean; big?: boolean }
+          | { kind: 'row'; left: string; right: string; bold: boolean }
+          | { kind: 'sep' }
+          | { kind: 'sigline' };
+        const drawLines: DrawLine[] = [];
+        // forceCenter: true while walking inside .header, whose CSS centers every child —
+        // carried through explicitly instead of only matching specific known classes, so a
+        // line like transfer tickets' "TRASPASO ENTRE SUCURSALES" (just class="bold", no
+        // class of its own for alignment) still centers like it does in the real HTML/print.
+        const walk = (el: Element, forceCenter = false) => {
+          Array.from(el.children).forEach(child => {
+            const tag = child.tagName;
+            const cls = child.className || '';
+            if (tag === 'IMG') return; // logo drawn separately below, from the preloaded ref
+            if (tag === 'HR') { drawLines.push({ kind: 'sep' }); return; }
+            if (cls.includes('sig-line')) { drawLines.push({ kind: 'sigline' }); return; }
+            if (cls.includes('row')) {
+              const spans = child.querySelectorAll(':scope > span');
+              if (spans.length >= 2) {
+                drawLines.push({ kind: 'row', left: (spans[0].textContent || '').trim(), right: (spans[1].textContent || '').trim(), bold: cls.includes('total-row') });
+                return;
+              }
+            }
+            if (tag === 'DIV' && child.children.length > 0) { walk(child, forceCenter || cls.includes('header') || cls.includes('sig-block')); return; } // container (.header/.footer/.sig-block) — recurse
+            const text = (child.textContent || '').trim();
+            if (!text) return;
+            const bold = cls.includes('bold') || cls.includes('biz-name') || cls.includes('sig-label') || cls.includes('thanks');
+            const center = forceCenter || cls.includes('biz-name') || cls.includes('tagline') || cls.includes('txn-id') || cls.includes('sig-label') || cls.includes('sig-sub') || cls.includes('sig-name') || cls.includes('legal') || cls.includes('thanks');
+            drawLines.push({ kind: 'text', text, center, bold, big: cls.includes('biz-name') });
+          });
+        };
+        walk(container);
+        container.remove();
 
         const pw = printConfig.paperWidth;
-        const canvasWidth = pw === 'A4' ? 800 : pw === '80mm' ? 380 : 280;
-        const lineHeight = 22;
-        const padding = 16;
+        // 384px/58mm and 576px/80mm are the standard ESC/POS raster widths thermal printers
+        // (including the Bixolon SPP-R200III) expect at 203 DPI — mismatching this is what
+        // made mPrint crop the ticket to a random-looking center strip last time.
+        const canvasWidth = pw === 'A4' ? 800 : pw === '80mm' ? 576 : 384;
+        const padding = Math.round(canvasWidth * 0.05);
+        const usableWidth = canvasWidth - padding * 2;
+        const fontRegular = Math.round(canvasWidth / 18);
+        const fontBig = Math.round(fontRegular * 1.4);
+        const lineHeight = Math.round(fontRegular * 1.5);
+        const sepHeight = Math.round(lineHeight * 0.7);
+
+        const logo = logoImgRef.current;
+        const hasLogo = !!(logo && logo.complete && logo.naturalWidth > 0);
+        const logoSize = hasLogo ? Math.round(canvasWidth * 0.22) : 0;
+        const logoMargin = hasLogo ? Math.round(padding * 0.75) : 0;
+
+        const contentHeight = drawLines.reduce((acc, l) => acc + (l.kind === 'sep' ? sepHeight : l.kind === 'sigline' ? Math.round(lineHeight * 1.5) : l.kind === 'text' && l.big ? Math.round(lineHeight * 1.4) : lineHeight), 0);
+
         const canvas = document.createElement('canvas');
         canvas.width = canvasWidth;
-        canvas.height = lines.length * lineHeight + padding * 2;
+        canvas.height = Math.max(padding * 2 + logoSize + logoMargin + contentHeight, 100);
         const ctx = canvas.getContext('2d');
         if (!ctx) throw new Error('no-canvas-context');
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.fillStyle = '#000';
-        ctx.font = '16px monospace';
         ctx.textBaseline = 'top';
-        lines.forEach((line, i) => ctx.fillText(line, padding, padding + i * lineHeight, canvasWidth - padding * 2));
+
+        let y = padding;
+        if (hasLogo && logo) {
+          ctx.drawImage(logo, (canvasWidth - logoSize) / 2, y, logoSize, logoSize);
+          y += logoSize + logoMargin;
+        }
+
+        for (const line of drawLines) {
+          if (line.kind === 'sep') {
+            ctx.save();
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            ctx.moveTo(padding, y + sepHeight / 2);
+            ctx.lineTo(canvasWidth - padding, y + sepHeight / 2);
+            ctx.strokeStyle = '#000';
+            ctx.stroke();
+            ctx.restore();
+            y += sepHeight;
+          } else if (line.kind === 'sigline') {
+            ctx.beginPath();
+            ctx.moveTo(padding, y + lineHeight * 0.75);
+            ctx.lineTo(canvasWidth - padding, y + lineHeight * 0.75);
+            ctx.strokeStyle = '#000';
+            ctx.stroke();
+            y += Math.round(lineHeight * 1.5);
+          } else if (line.kind === 'row') {
+            ctx.font = `${line.bold ? 'bold ' : ''}${fontRegular}px monospace`;
+            ctx.textAlign = 'left';
+            ctx.fillText(line.left, padding, y, usableWidth * 0.62);
+            ctx.textAlign = 'right';
+            ctx.fillText(line.right, canvasWidth - padding, y, usableWidth * 0.4);
+            y += lineHeight;
+          } else {
+            const size = line.big ? fontBig : fontRegular;
+            ctx.font = `${line.bold ? 'bold ' : ''}${size}px ${line.big ? 'sans-serif' : 'monospace'}`;
+            ctx.textAlign = line.center ? 'center' : 'left';
+            ctx.fillText(line.text, line.center ? canvasWidth / 2 : padding, y, usableWidth);
+            y += line.big ? Math.round(lineHeight * 1.4) : lineHeight;
+          }
+        }
+        ctx.textAlign = 'left';
 
         const base64 = canvas.toDataURL('image/png').split(',')[1];
         const byteChars = atob(base64);
