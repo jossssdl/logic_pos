@@ -1989,6 +1989,47 @@ export default function App() {
       return;
     }
 
+    // iOS (Safari, and every other iOS browser — Apple forces them all onto WebKit) has no
+    // Web Bluetooth at all, so it always falls through to window.print() below — which on
+    // iOS always opens AirPrint directly, with no way for the page to route it anywhere
+    // else. Bixolon's "mPrint" app (and similar thermal-printer companion apps) bridge this
+    // by accepting a file through iOS's native Share Sheet instead: build the ticket as a
+    // PDF and hand it to navigator.share(), so the user can pick mPrint there (AirPrint and
+    // "Guardar en Archivos" are still available from that same sheet — nothing is lost for
+    // people who don't use mPrint). Falls through to window.print() if Share isn't usable.
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS && typeof navigator.share === 'function') {
+      const pw = printConfig.paperWidth;
+      const pdfWidthMm = pw === 'A4' ? 210 : pw === '80mm' ? 80 : 58;
+      const pdfHeightMm = pw === 'A4' ? 297 : 200; // generous fixed height for receipts; may need tuning once tested on a real device
+
+      const container = document.createElement('div');
+      container.style.cssText = 'position:fixed; left:-10000px; top:0;';
+      container.innerHTML = `<style>${ticketStylesFn('#logicpos-share-ticket')}</style><div id="logicpos-share-ticket">${ticketBodyHtml}</div>`;
+      document.body.appendChild(container);
+
+      const doc = new jsPDF({ unit: 'mm', format: [pdfWidthMm, pdfHeightMm] });
+      doc.html(container, {
+        x: 0,
+        y: 0,
+        width: pdfWidthMm,
+        windowWidth: container.scrollWidth || 302,
+        callback: async (finishedDoc) => {
+          container.remove();
+          try {
+            const pdfBlob = finishedDoc.output('blob');
+            const file = new File([pdfBlob], `${docTitle}.pdf`, { type: 'application/pdf' });
+            if (navigator.canShare && !navigator.canShare({ files: [file] })) throw new Error('share-files-unsupported');
+            await navigator.share({ files: [file], title: docTitle });
+          } catch (err) {
+            console.error('iOS share error:', err);
+            window.print();
+          }
+        }
+      });
+      return;
+    }
+
     // Web: open the ticket in its own tab that prints itself on load. This is the only
     // approach verified to render correctly on Chrome for Android (tested on the client's
     // device): its print service rasterizes the *visible page* — it ignores both hidden
