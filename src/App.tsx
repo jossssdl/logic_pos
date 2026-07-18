@@ -2050,7 +2050,14 @@ export default function App() {
             if (tag === 'HR') { drawLines.push({ kind: 'sep' }); return; }
             if (cls.includes('sig-line')) { drawLines.push({ kind: 'sigline' }); return; }
             if (cls.includes('row')) {
-              const spans = child.querySelectorAll(':scope > span');
+              // Plain .children filtering instead of querySelectorAll(':scope > span') —
+              // this exact spot is the prime suspect for why item/total rows printed as two
+              // separate plain lines instead of one left+right row: if :scope selector
+              // support/behavior is at all inconsistent on the device, this check silently
+              // falls through to the generic DIV-recurse branch below, which treats each
+              // <span> as its own independent, unstyled line — matching exactly what showed
+              // up on the printed ticket.
+              const spans = Array.from(child.children).filter(c => c.tagName === 'SPAN');
               if (spans.length >= 2) {
                 drawLines.push({ kind: 'row', left: (spans[0].textContent || '').trim(), right: (spans[1].textContent || '').trim(), bold: cls.includes('total-row') });
                 return;
