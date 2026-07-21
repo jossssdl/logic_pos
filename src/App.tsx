@@ -1761,44 +1761,53 @@ export default function App() {
   // Cart quantities are hard-capped at the active branch's available stock so a sale can
   // never exceed physical inventory (no oversell). Stock is read live from `products`
   // (not the cart's product snapshot) in case it changed since the item was added.
+  // Reads/writes go through the functional setCart(prev => ...) form rather than the
+  // `cart` closure variable. Two rapid clicks (double-tap, slow touchscreen) can fire
+  // before React re-renders with the first click's update, so a version reading the
+  // outer `cart` would have both clicks see the same stale snapshot — creating two
+  // separate cart entries for the same product (or losing one of the two +1s) instead
+  // of a single correctly-summed line. The functional form guarantees each update is
+  // applied on top of the truly-latest state, in order.
   const addToCart = (product: Product) => {
     const available = getProductStock(product, selectedBranchId);
-    const idx = cart.findIndex(item => item.product.id === product.id);
-    const currentQty = idx > -1 ? cart[idx].quantity : 0;
-    if (currentQty + 1 > available) {
-      alert(`No hay stock suficiente de "${product.name}" en esta sucursal.\nDisponible: ${available} u.${currentQty > 0 ? ` · Ya tienes ${currentQty} en el carrito.` : ''}`);
-      return;
-    }
-    if (idx > -1) {
-      const newCart = [...cart];
-      newCart[idx].quantity += 1;
-      setCart(newCart);
-    } else {
-      setCart([...cart, { product, quantity: 1 }]);
-    }
+    setCart(prevCart => {
+      const idx = prevCart.findIndex(item => item.product.id === product.id);
+      const currentQty = idx > -1 ? prevCart[idx].quantity : 0;
+      if (currentQty + 1 > available) {
+        alert(`No hay stock suficiente de "${product.name}" en esta sucursal.\nDisponible: ${available} u.${currentQty > 0 ? ` · Ya tienes ${currentQty} en el carrito.` : ''}`);
+        return prevCart;
+      }
+      if (idx > -1) {
+        const newCart = [...prevCart];
+        newCart[idx] = { ...newCart[idx], quantity: newCart[idx].quantity + 1 };
+        return newCart;
+      }
+      return [...prevCart, { product, quantity: 1 }];
+    });
   };
 
   const updateCartQty = (productId: string, val: number) => {
-    const item = cart.find(i => i.product.id === productId);
-    if (!item) return;
-    const newQty = item.quantity + val;
-    if (newQty <= 0) {
-      setCart(cart.filter(i => i.product.id !== productId));
-      return;
-    }
-    if (val > 0) {
-      const liveProduct = products.find(p => p.id === productId) || item.product;
-      const available = getProductStock(liveProduct, selectedBranchId);
-      if (newQty > available) {
-        alert(`No hay stock suficiente de "${item.product.name}" en esta sucursal.\nDisponible: ${available} u.`);
-        return;
+    setCart(prevCart => {
+      const item = prevCart.find(i => i.product.id === productId);
+      if (!item) return prevCart;
+      const newQty = item.quantity + val;
+      if (newQty <= 0) {
+        return prevCart.filter(i => i.product.id !== productId);
       }
-    }
-    setCart(cart.map(i => i.product.id === productId ? { ...i, quantity: newQty } : i));
+      if (val > 0) {
+        const liveProduct = products.find(p => p.id === productId) || item.product;
+        const available = getProductStock(liveProduct, selectedBranchId);
+        if (newQty > available) {
+          alert(`No hay stock suficiente de "${item.product.name}" en esta sucursal.\nDisponible: ${available} u.`);
+          return prevCart;
+        }
+      }
+      return prevCart.map(i => i.product.id === productId ? { ...i, quantity: newQty } : i);
+    });
   };
 
   const removeFromCart = (productId: string) => {
-    setCart(cart.filter(i => i.product.id !== productId));
+    setCart(prevCart => prevCart.filter(i => i.product.id !== productId));
   };
 
   // Cart Metrics
@@ -4182,7 +4191,7 @@ export default function App() {
             { id: 'invoicing',  label: 'Facturación',         icon: <FileText className="w-5 h-5" /> },
             { id: 'history',    label: 'Historial / Caja',    icon: <Receipt className="w-5 h-5" /> },
             { id: 'analytics',  label: 'Estadísticas',        icon: <BarChart3 className="w-5 h-5" /> },
-          ].map(({ id, label, icon }) => (
+          ].filter(item => item.id !== 'branches' || activeCompanyRole === 'owner').map(({ id, label, icon }) => (
             <button key={id} id={`nav-${id}`}
               onClick={() => { setActiveTab(id as typeof activeTab); setIsMobileMenuOpen(false); }}
               className={activeTab === id ? navActiveClass : navInactiveClass}
